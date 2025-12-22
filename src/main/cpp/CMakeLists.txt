@@ -194,6 +194,8 @@ add_library(
   src/DateTimeUtilsJni.cpp
   src/DecimalUtilsJni.cpp
   src/DeviceAttrJni.cpp
+  src/FusedOperatorsJni.cpp
+  src/FusedTransformAggregateJni.cpp
   src/GpuTimeZoneDBJni.cpp
   src/HashJni.cpp
   src/HistogramJni.cpp
@@ -234,6 +236,8 @@ add_library(
   src/format_float.cu
   src/from_json_to_raw_map.cu
   src/from_json_to_structs.cu
+  src/fused_operators.cu
+  src/fused_transform_aggregate.cu
   src/get_json_object.cu
   src/histogram.cu
   src/hive_hash.cu
@@ -261,6 +265,8 @@ add_library(
   src/uuid.cu
   src/xxhash64.cu
   src/zorder.cu
+  # Batched aggregate optimization for many-column aggregations
+  src/batched_aggregate.cu
 )
 
 set_target_properties(

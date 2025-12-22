@@ -127,3 +127,15 @@ ConfigureTest(CONV
 
 ConfigureTest(MULTIPLY
     multiply.cpp)
+
+ConfigureTest(BATCHED_AGGREGATE
+    batched_aggregate.cu)
+
+ConfigureTest(FUSED_TRANSFORM_AGGREGATE
+    fused_transform_aggregate_test.cu)
+
+ConfigureTest(FUSED_COMPARISON_BENCHMARK
+    fused_comparison_benchmark.cu)
+
+ConfigureTest(OPTIMIZATION_COMPARISON_BENCHMARK
+    optimization_comparison_benchmark.cu)
