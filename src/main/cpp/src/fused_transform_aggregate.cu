@@ -33,7 +33,9 @@
 #include <rmm/exec_policy.hpp>
 #include <rmm/mr/device_memory_resource.hpp>
 
+#include <thrust/binary_search.h>
 #include <thrust/sequence.h>
+#include <thrust/transform.h>
 
 #include <chrono>
 #include <vector>
@@ -42,47 +44,15 @@ namespace spark_rapids_jni {
 
 namespace {
 
-constexpr size_t BUFFER_ALIGNMENT = 8;
 constexpr int BLOCK_SIZE = 256;
+constexpr size_t ALIGNMENT = 256;  // 256-byte alignment for GPU efficiency
 
 /**
- * @brief Round up to the nearest multiple of alignment
+ * @brief Align a size to ALIGNMENT boundary
  */
-constexpr size_t align_size(size_t size, size_t alignment = BUFFER_ALIGNMENT)
-{
-  return (size + alignment - 1) & ~(alignment - 1);
+inline size_t align_size(size_t size) {
+  return (size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
 }
-
-/**
- * @brief Custom memory resource that allocates from a pre-existing buffer
- */
-class contiguous_buffer_resource final : public rmm::mr::device_memory_resource {
- public:
-  contiguous_buffer_resource(void* base, std::size_t size)
-      : base_(static_cast<uint8_t*>(base)), size_(size), offset_(0) {}
-
-  void* do_allocate(std::size_t bytes, rmm::cuda_stream_view) override {
-    std::size_t aligned_offset = align_size(offset_, BUFFER_ALIGNMENT);
-    CUDF_EXPECTS(aligned_offset + bytes <= size_, 
-                 "Contiguous buffer exhausted");
-    void* ptr = base_ + aligned_offset;
-    offset_ = aligned_offset + bytes;
-    return ptr;
-  }
-
-  void do_deallocate(void*, std::size_t, rmm::cuda_stream_view) noexcept override {
-    // No-op: memory is freed when the parent buffer is destroyed
-  }
-
-  [[nodiscard]] bool do_is_equal(device_memory_resource const& other) const noexcept override {
-    return this == &other;
-  }
-
- private:
-  uint8_t* base_;
-  std::size_t size_;
-  std::size_t offset_;
-};
 
 /**
  * @brief Convert FusedExprSpec to DeviceExprSpec
@@ -225,6 +195,24 @@ FusedExecutionResult execute_fused_transform_aggregate(
   CUDF_EXPECTS(can_fuse(plan, &validation_error), 
                "Invalid execution plan: " + validation_error);
   
+  // Validate column indices are within bounds
+  auto num_cols = input.num_columns();
+  for (size_t i = 0; i < plan.expressions.size(); ++i) {
+    auto const& expr = plan.expressions[i];
+    CUDF_EXPECTS(expr.value_col_idx < num_cols,
+                 "Expression " + std::to_string(i) + " value_col_idx (" + 
+                 std::to_string(expr.value_col_idx) + ") >= num_columns (" +
+                 std::to_string(num_cols) + ")");
+    if (expr.cond_col_idx >= 0) {
+      CUDF_EXPECTS(expr.cond_col_idx < num_cols,
+                   "Expression " + std::to_string(i) + " cond_col_idx out of bounds");
+    }
+    if (expr.other_col_idx >= 0) {
+      CUDF_EXPECTS(expr.other_col_idx < num_cols,
+                   "Expression " + std::to_string(i) + " other_col_idx out of bounds");
+    }
+  }
+  
   FusedExecutionResult result;
   result.stats.num_expressions_fused = plan.expressions.size();
   result.stats.execution_strategy = plan.enable_warp_reduction ? "warp_reduction" : "basic";
@@ -265,53 +253,35 @@ FusedExecutionResult execute_fused_transform_aggregate(
   // offsets: [0, 3, 5, 8] -> group_ids: [0,0,0,1,1,2,2,2]
   rmm::device_uvector<cudf::size_type> d_group_ids(num_rows, stream, mr);
   
-  // Simple kernel to expand offsets to group IDs
+  // Copy offsets to device (single memcpy instead of N calls)
   auto const& offsets = groups.offsets;
   rmm::device_uvector<cudf::size_type> d_offsets(offsets.size(), stream, mr);
   cudaMemcpyAsync(d_offsets.data(), offsets.data(), 
                   offsets.size() * sizeof(cudf::size_type),
                   cudaMemcpyHostToDevice, stream.value());
   
-  // Fill group IDs
+  // Use thrust::upper_bound to compute group IDs efficiently
+  // For each row i, find the group by binary searching offsets
+  // upper_bound returns iterator to first offset > i, minus 1 is the group index
   {
-    // Use thrust to expand offsets to labels
-    thrust::fill(rmm::exec_policy_nosync(stream, mr), 
-                 d_group_ids.begin(), d_group_ids.end(), 
-                 cudf::size_type(0));
-    
-    // Mark group boundaries
-    for (size_t g = 0; g < offsets.size() - 1; ++g) {
-      if (offsets[g] < num_rows) {
-        cudaMemcpyAsync(d_group_ids.data() + offsets[g], &g,
-                        sizeof(cudf::size_type), cudaMemcpyHostToDevice, stream.value());
-      }
-    }
-    
-    // Prefix sum to propagate group IDs
-    thrust::inclusive_scan(rmm::exec_policy_nosync(stream, mr),
-                           d_group_ids.begin(), d_group_ids.end(),
-                           d_group_ids.begin(),
-                           thrust::maximum<cudf::size_type>());
+    auto row_indices = thrust::make_counting_iterator<cudf::size_type>(0);
+    thrust::upper_bound(rmm::exec_policy_nosync(stream, mr),
+                        d_offsets.begin(), d_offsets.end(),
+                        row_indices, row_indices + num_rows,
+                        d_group_ids.begin());
+    // upper_bound gives us offset index, subtract 1 to get group ID
+    // e.g., if upper_bound returns 2, it means row is in group 1
+    thrust::transform(rmm::exec_policy_nosync(stream, mr),
+                      d_group_ids.begin(), d_group_ids.end(),
+                      d_group_ids.begin(),
+                      [] __device__ (cudf::size_type idx) { return idx - 1; });
   }
   
   // ============================================================================
-  // Step 2: Allocate shared output buffer
+  // Step 2: Prepare intermediate buffers
   // ============================================================================
-  
-  // Calculate required buffer size
-  size_t sum_buffer_size = num_exprs * num_groups * sizeof(int64_t);
-  size_t count_buffer_size = num_exprs * num_groups * sizeof(int64_t);  // For AVG
-  size_t total_buffer_size = align_size(sum_buffer_size) + align_size(count_buffer_size);
-  
-  // Add space for output columns (final results)
-  for (auto const& expr : plan.expressions) {
-    total_buffer_size += align_size(sizeof(int64_t) * num_groups);  // Data
-    total_buffer_size += align_size(cudf::bitmask_allocation_size_bytes(num_groups));  // Validity
-  }
-  
-  result.shared_buffer = rmm::device_buffer(total_buffer_size, stream, mr);
-  result.buffer_mr = std::make_unique<contiguous_buffer_resource>(
-      result.shared_buffer.data(), result.shared_buffer.size());
+  // NOTE: Output columns are created with the default MR (independent memory).
+  // No shared buffer is needed - each column owns its own memory.
   
   // ============================================================================
   // Step 3: Prepare device data structures

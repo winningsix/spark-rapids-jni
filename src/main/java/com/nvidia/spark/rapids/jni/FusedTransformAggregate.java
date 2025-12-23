@@ -308,23 +308,28 @@ public class FusedTransformAggregate {
         LOG.debug("Fused transform+aggregate completed in {} ms", elapsedMs);
 
         // Parse returned handles: [numKeyCols, keyCol0, ..., numValCols, valCol0, ...]
+        return parseResult(handles);
+    }
+    
+    /**
+     * Parse JNI result handles into FusedResult.
+     * Format: [numKeyCols, keyCol0, ..., numValCols, valCol0, ...]
+     */
+    private static FusedResult parseResult(long[] handles) {
         int idx = 0;
         int numKeyCols = (int) handles[idx++];
         
-        // Extract key column handles
+        // Extract key columns
         long[] keyColHandles = new long[numKeyCols];
-        for (int i = 0; i < numKeyCols; i++) {
-            keyColHandles[i] = handles[idx++];
-        }
+        System.arraycopy(handles, idx, keyColHandles, 0, numKeyCols);
+        idx += numKeyCols;
         
-        // Extract value column handles
+        // Extract value columns
         int numValCols = (int) handles[idx++];
         long[] valColHandles = new long[numValCols];
-        for (int i = 0; i < numValCols; i++) {
-            valColHandles[i] = handles[idx++];
-        }
+        System.arraycopy(handles, idx, valColHandles, 0, numValCols);
         
-        // Build Tables from native handles
+        // Build Tables from native handles (each column owns its memory independently)
         Table keys = numKeyCols > 0 ? new Table(keyColHandles) : null;
         Table values = numValCols > 0 ? new Table(valColHandles) : null;
         

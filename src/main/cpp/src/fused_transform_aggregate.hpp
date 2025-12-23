@@ -156,25 +156,20 @@ struct FusedExecutionPlan {
 /**
  * @brief Result of fused transform + aggregate execution
  * 
- * Memory ownership: The shared_buffer holds all output data. The buffer_mr
- * must outlive the output tables since columns reference the shared buffer.
- * Destruction order: output tables first, then buffer_mr, then shared_buffer.
+ * Memory ownership: Each output column owns its memory independently
+ * using the default memory resource. No shared buffer is used.
+ * Columns can be closed in any order.
  */
 struct FusedExecutionResult {
-  // Output data (destroyed first)
   std::unique_ptr<cudf::table> output_keys;    // Group-by keys
   std::unique_ptr<cudf::table> output_values;  // Aggregated values
   
-  // Memory management (destroyed last)
-  rmm::device_buffer shared_buffer;
-  std::unique_ptr<rmm::mr::device_memory_resource> buffer_mr;
-  
   // Execution statistics
   struct Stats {
-    int64_t kernel_time_ns;
-    int64_t total_time_ns;
-    int32_t num_expressions_fused;
-    int32_t num_groups;
+    int64_t kernel_time_ns = 0;
+    int64_t total_time_ns = 0;
+    int32_t num_expressions_fused = 0;
+    int32_t num_groups = 0;
     std::string execution_strategy;
   } stats;
   

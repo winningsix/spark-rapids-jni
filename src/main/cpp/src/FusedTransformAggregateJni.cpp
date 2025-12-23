@@ -20,6 +20,8 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 
+#include <memory>
+
 extern "C" {
 
 /**
@@ -33,7 +35,7 @@ extern "C" {
 JNIEXPORT jlongArray JNICALL
 Java_com_nvidia_spark_rapids_jni_FusedTransformAggregate_executeFused(
     JNIEnv* env,
-    jclass j_class,
+    jclass,
     jlong input_table_handle,
     jintArray group_by_indices,
     jintArray transform_ops,
@@ -52,25 +54,41 @@ Java_com_nvidia_spark_rapids_jni_FusedTransformAggregate_executeFused(
   JNI_NULL_CHECK(env, agg_ops, "Agg ops are null", nullptr);
   JNI_NULL_CHECK(env, value_col_indices, "Value column indices are null", nullptr);
   
-  try {
+  JNI_TRY
+  {
     cudf::jni::auto_set_device(env);
     
+    // Get input table view
     auto const& input_table = *reinterpret_cast<cudf::table_view const*>(input_table_handle);
     
-    // Get array lengths
-    jsize num_exprs = env->GetArrayLength(transform_ops);
-    jsize num_group_by_cols = env->GetArrayLength(group_by_indices);
+    // Use native array wrappers for automatic resource management
+    auto const j_group_by = cudf::jni::native_jintArray(env, group_by_indices);
+    auto const j_transform_ops = cudf::jni::native_jintArray(env, transform_ops);
+    auto const j_agg_ops = cudf::jni::native_jintArray(env, agg_ops);
+    auto const j_value_cols = cudf::jni::native_jintArray(env, value_col_indices);
     
-    // Get array elements
-    jint* j_group_by = env->GetIntArrayElements(group_by_indices, nullptr);
-    jint* j_transform_ops = env->GetIntArrayElements(transform_ops, nullptr);
-    jint* j_agg_ops = env->GetIntArrayElements(agg_ops, nullptr);
-    jint* j_value_cols = env->GetIntArrayElements(value_col_indices, nullptr);
-    jint* j_cond_cols = cond_col_indices ? env->GetIntArrayElements(cond_col_indices, nullptr) : nullptr;
-    jint* j_other_cols = other_col_indices ? env->GetIntArrayElements(other_col_indices, nullptr) : nullptr;
-    jlong* j_defaults = default_vals ? env->GetLongArrayElements(default_vals, nullptr) : nullptr;
-    jlong* j_thresholds = thresholds ? env->GetLongArrayElements(thresholds, nullptr) : nullptr;
-    jlong* j_else_vals = else_vals ? env->GetLongArrayElements(else_vals, nullptr) : nullptr;
+    // Optional arrays - use unique_ptr for RAII with optional construction
+    std::unique_ptr<cudf::jni::native_jintArray> j_cond_cols_ptr;
+    std::unique_ptr<cudf::jni::native_jintArray> j_other_cols_ptr;
+    std::unique_ptr<cudf::jni::native_jlongArray> j_defaults_ptr;
+    std::unique_ptr<cudf::jni::native_jlongArray> j_thresholds_ptr;
+    std::unique_ptr<cudf::jni::native_jlongArray> j_else_vals_ptr;
+    
+    if (cond_col_indices) {
+      j_cond_cols_ptr = std::make_unique<cudf::jni::native_jintArray>(env, cond_col_indices);
+    }
+    if (other_col_indices) {
+      j_other_cols_ptr = std::make_unique<cudf::jni::native_jintArray>(env, other_col_indices);
+    }
+    if (default_vals) {
+      j_defaults_ptr = std::make_unique<cudf::jni::native_jlongArray>(env, default_vals);
+    }
+    if (thresholds) {
+      j_thresholds_ptr = std::make_unique<cudf::jni::native_jlongArray>(env, thresholds);
+    }
+    if (else_vals) {
+      j_else_vals_ptr = std::make_unique<cudf::jni::native_jlongArray>(env, else_vals);
+    }
     
     // Build execution plan
     spark_rapids_jni::FusedExecutionPlan plan;
@@ -78,82 +96,64 @@ Java_com_nvidia_spark_rapids_jni_FusedTransformAggregate_executeFused(
     plan.enable_perfect_hash = true;
     
     // Add group-by columns
-    for (jsize i = 0; i < num_group_by_cols; ++i) {
+    plan.group_by_col_indices.reserve(j_group_by.size());
+    for (int i = 0; i < j_group_by.size(); ++i) {
       plan.group_by_col_indices.push_back(j_group_by[i]);
     }
     
     // Add expressions
-    for (jsize i = 0; i < num_exprs; ++i) {
+    auto const num_exprs = j_transform_ops.size();
+    plan.expressions.reserve(num_exprs);
+    for (int i = 0; i < num_exprs; ++i) {
       spark_rapids_jni::FusedExprSpec spec;
       spec.transform_op = static_cast<spark_rapids_jni::TransformOp>(j_transform_ops[i]);
       spec.agg_op = static_cast<spark_rapids_jni::AggOp>(j_agg_ops[i]);
       spec.value_col_idx = j_value_cols[i];
-      spec.cond_col_idx = j_cond_cols ? j_cond_cols[i] : -1;
-      spec.other_col_idx = j_other_cols ? j_other_cols[i] : -1;
-      spec.default_val = j_defaults ? j_defaults[i] : 0;
-      spec.threshold = j_thresholds ? j_thresholds[i] : 0;
-      spec.else_val = j_else_vals ? j_else_vals[i] : 0;
+      spec.cond_col_idx = j_cond_cols_ptr ? (*j_cond_cols_ptr)[i] : -1;
+      spec.other_col_idx = j_other_cols_ptr ? (*j_other_cols_ptr)[i] : -1;
+      spec.default_val = j_defaults_ptr ? (*j_defaults_ptr)[i] : 0;
+      spec.threshold = j_thresholds_ptr ? (*j_thresholds_ptr)[i] : 0;
+      spec.else_val = j_else_vals_ptr ? (*j_else_vals_ptr)[i] : 0;
       spec.output_type = cudf::data_type{cudf::type_id::INT64};
       spec.output_idx = i;
       
       plan.expressions.push_back(spec);
     }
     
-    // Release arrays
-    env->ReleaseIntArrayElements(group_by_indices, j_group_by, JNI_ABORT);
-    env->ReleaseIntArrayElements(transform_ops, j_transform_ops, JNI_ABORT);
-    env->ReleaseIntArrayElements(agg_ops, j_agg_ops, JNI_ABORT);
-    env->ReleaseIntArrayElements(value_col_indices, j_value_cols, JNI_ABORT);
-    if (j_cond_cols) env->ReleaseIntArrayElements(cond_col_indices, j_cond_cols, JNI_ABORT);
-    if (j_other_cols) env->ReleaseIntArrayElements(other_col_indices, j_other_cols, JNI_ABORT);
-    if (j_defaults) env->ReleaseLongArrayElements(default_vals, j_defaults, JNI_ABORT);
-    if (j_thresholds) env->ReleaseLongArrayElements(thresholds, j_thresholds, JNI_ABORT);
-    if (j_else_vals) env->ReleaseLongArrayElements(else_vals, j_else_vals, JNI_ABORT);
-    
-    // Execute
+    // Execute fused transform + aggregate
     auto result = spark_rapids_jni::execute_fused_transform_aggregate(
         input_table,
         plan,
         cudf::get_default_stream(),
         cudf::get_current_device_resource_ref());
     
-    // Build return array with column handles
-    // Format: [numKeyCols, keyCol0, ..., numValCols, valCol0, ...]
-    int num_key_cols = result.output_keys ? result.output_keys->num_columns() : 0;
-    int num_val_cols = result.output_values ? result.output_values->num_columns() : 0;
-    int total_handles = 2 + num_key_cols + num_val_cols;  // +2 for counts
+    // Build output: [numKeyCols, keyCol0, ..., numValCols, valCol0, ...]
+    auto const num_key_cols = result.output_keys ? result.output_keys->num_columns() : 0;
+    auto const num_val_cols = result.output_values ? result.output_values->num_columns() : 0;
+    auto const total_handles = 2 + num_key_cols + num_val_cols;
     
-    std::vector<jlong> handles(total_handles);
+    auto out_handles = cudf::jni::native_jlongArray(env, total_handles);
     int idx = 0;
     
-    // Key columns - release ownership to Java
-    handles[idx++] = num_key_cols;
+    // Key columns
+    out_handles[idx++] = num_key_cols;
     if (result.output_keys) {
-      auto key_cols = result.output_keys->release();
-      for (auto& col : key_cols) {
-        handles[idx++] = reinterpret_cast<jlong>(col.release());
+      for (auto& col : result.output_keys->release()) {
+        out_handles[idx++] = cudf::jni::release_as_jlong(col);
       }
     }
     
-    // Value columns - release ownership to Java
-    handles[idx++] = num_val_cols;
+    // Value columns
+    out_handles[idx++] = num_val_cols;
     if (result.output_values) {
-      auto val_cols = result.output_values->release();
-      for (auto& col : val_cols) {
-        handles[idx++] = reinterpret_cast<jlong>(col.release());
+      for (auto& col : result.output_values->release()) {
+        out_handles[idx++] = cudf::jni::release_as_jlong(col);
       }
     }
     
-    // NOTE: shared_buffer and buffer_mr are not used since columns use default MR
-    // They will be destroyed when result goes out of scope
-    
-    // Create and return Java array
-    jlongArray ret = env->NewLongArray(total_handles);
-    env->SetLongArrayRegion(ret, 0, total_handles, handles.data());
-    
-    return ret;
+    return out_handles.get_jArray();
   }
-  CATCH_STD(env, nullptr);
+  JNI_CATCH(env, nullptr);
 }
 
 /**
@@ -162,7 +162,7 @@ Java_com_nvidia_spark_rapids_jni_FusedTransformAggregate_executeFused(
 JNIEXPORT jboolean JNICALL
 Java_com_nvidia_spark_rapids_jni_FusedTransformAggregate_canFuse(
     JNIEnv* env,
-    jclass j_class,
+    jclass,
     jint num_expressions,
     jint num_group_by_cols)
 {
