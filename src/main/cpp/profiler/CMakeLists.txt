@@ -55,6 +55,9 @@ target_include_directories(
   profilerjni
   PRIVATE "${JNI_INCLUDE_DIRS}"
           "${CUDAToolkit_INCLUDE_DIRS}"
+          "${CUDAToolkit_INCLUDE_DIRS}/../extras/CUPTI/include"
+          "/usr/local/cuda/extras/CUPTI/include"
+          "/usr/local/cuda-12.6/extras/CUPTI/include"
           "${SPARK_RAPIDS_JNI_GENERATED_INCLUDE_DIR}"
           "${SPARK_RAPIDS_JNI_SOURCE_DIR}/src"
 )
@@ -62,6 +65,8 @@ target_include_directories(
 find_library(CUPTI_LIBRARY_PATH cupti_static PATHS
   "/usr/local/cuda/lib64"
   "/usr/local/cuda/extras/CUPTI/lib64"
+  "/usr/local/cuda-12.6/extras/CUPTI/lib64"
+  "${CUDAToolkit_LIBRARY_DIR}/../extras/CUPTI/lib64"
 )
 
 target_link_libraries(profilerjni
@@ -89,6 +94,9 @@ target_include_directories(
   spark_rapids_profile_converter
   PRIVATE
   "${CUDAToolkit_INCLUDE_DIRS}"
+  "${CUDAToolkit_INCLUDE_DIRS}/../extras/CUPTI/include"
+  "/usr/local/cuda/extras/CUPTI/include"
+  "/usr/local/cuda-12.6/extras/CUPTI/include"
   "${SPARK_RAPIDS_JNI_SOURCE_DIR}/profiler"
   "${SPARK_RAPIDS_JNI_SOURCE_DIR}/src"
   "${SPARK_RAPIDS_JNI_GENERATED_INCLUDE_DIR}"

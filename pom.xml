@@ -77,7 +77,7 @@
     <arrow.version>0.15.1</arrow.version>
     <CPP_PARALLEL_LEVEL>10</CPP_PARALLEL_LEVEL>
     <GPU_ARCHS>DEPRECATED</GPU_ARCHS>
-    <CMAKE_CUDA_ARCHITECTURES>RAPIDS</CMAKE_CUDA_ARCHITECTURES>
+    <CMAKE_CUDA_ARCHITECTURES>70;75;80;86;89;90</CMAKE_CUDA_ARCHITECTURES>
     <CUDF_USE_PER_THREAD_DEFAULT_STREAM>ON</CUDF_USE_PER_THREAD_DEFAULT_STREAM>
     <RMM_LOGGING_LEVEL>OFF</RMM_LOGGING_LEVEL>
     <USE_GDS>OFF</USE_GDS>
@@ -114,6 +114,7 @@
     <slf4j.version>1.7.30</slf4j.version>
     <iceberg.version>1.6.1</iceberg.version>
     <submodule.check.skip>false</submodule.check.skip>
+    <native.build.skip>false</native.build.skip>
     <!-- This skips applying and unapplying patchs to CUDF. Be aware that if you 
     try to build the main jar without patching CUDF it could result in build
     failures because the two often need to be in sync with each other. So use
@@ -445,6 +446,7 @@
             <id>buildcpp</id>
             <phase>validate</phase>
             <configuration>
+              <skip>${native.build.skip}</skip>
               <target>
                 <exec dir="${project.basedir}"
                       failonerror="true"

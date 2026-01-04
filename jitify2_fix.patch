@@ -1,0 +1,11 @@
+--- a/jitify2.hpp
++++ b/jitify2.hpp
+@@ -4531,7 +4531,7 @@ inline std::string StringRef::str() const { return {ptr, size}; }
+   auto log = LogDebug("Jitify");
+   auto error = [&]() { return log.clear_message(), Error(__FILE__, __LINE__); };
+ 
+-  bool pch_verbose = true;
++  [[maybe_unused]] bool pch_verbose = true;
+   for (const std::string& include : jitify_options.pch.includes) {
+     if (!include.empty()) {
+       pch_includes.insert(include);
