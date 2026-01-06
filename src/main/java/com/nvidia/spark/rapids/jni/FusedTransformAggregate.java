@@ -18,7 +18,6 @@ package com.nvidia.spark.rapids.jni;
 
 import ai.rapids.cudf.NativeDepsLoader;
 import ai.rapids.cudf.Table;
-import ai.rapids.cudf.CudfException;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -32,16 +31,144 @@ import org.slf4j.LoggerFactory;
  * with Aggregate operations in a single GPU kernel, eliminating intermediate
  * memory allocations and reducing memory bandwidth.
  * 
- * Memory Management:
- * - Returns Tables with columns that use cudf's default memory resource
- * - Columns have proper reference counting via cudf
- * - SpillableColumnarBatch can pack on-demand when spilling is needed
+ * <h2>Execution Modes</h2>
+ * <ul>
+ *   <li>{@link ExecutionMode#HAND_WRITTEN_KERNEL} - Custom CUDA kernel (original)</li>
+ *   <li>{@link ExecutionMode#JIT_TRANSFORM} - cudf JIT transform + groupby</li>
+ *   <li>{@link ExecutionMode#FUSED_1PASS} - Fused transform + 1st pass aggregation (fastest)</li>
+ *   <li>{@link ExecutionMode#AUTO} - Automatically select best mode based on data</li>
+ * </ul>
+ * 
+ * <h2>Memory Management</h2>
+ * <ul>
+ *   <li>Returns Tables with columns that use cudf's default memory resource</li>
+ *   <li>Columns have proper reference counting via cudf</li>
+ *   <li>SpillableColumnarBatch can pack on-demand when spilling is needed</li>
+ * </ul>
  */
 public class FusedTransformAggregate {
     private static final Logger LOG = LoggerFactory.getLogger(FusedTransformAggregate.class);
     
     static {
         NativeDepsLoader.loadNativeDeps();
+    }
+
+    // =========================================================================
+    // Execution Modes
+    // =========================================================================
+    
+    /**
+     * Execution mode for fused transform + aggregate operations.
+     */
+    public enum ExecutionMode {
+        /** Hand-written CUDA kernel (original implementation) */
+        HAND_WRITTEN_KERNEL(0),
+        
+        /** cudf JIT transform followed by groupby (flexible, some overhead) */
+        JIT_TRANSFORM(1),
+        
+        /** Fused transform + 1st pass aggregation (fastest, eliminates intermediate columns) */
+        FUSED_1PASS(2),
+        
+        /** Automatically select best mode based on data characteristics */
+        AUTO(3);
+        
+        private final int nativeValue;
+        
+        ExecutionMode(int nativeValue) {
+            this.nativeValue = nativeValue;
+        }
+        
+        public int getNativeValue() {
+            return nativeValue;
+        }
+        
+        public static ExecutionMode fromNative(int value) {
+            for (ExecutionMode mode : values()) {
+                if (mode.nativeValue == value) {
+                    return mode;
+                }
+            }
+            throw new IllegalArgumentException("Unknown execution mode: " + value);
+        }
+    }
+    
+    // =========================================================================
+    // Configuration
+    // =========================================================================
+    
+    /**
+     * Configuration for fused transform + aggregate operations.
+     */
+    public static class Config {
+        private ExecutionMode executionMode = ExecutionMode.AUTO;
+        private boolean enableWarpReduction = true;
+        private boolean enablePerfectHash = true;
+        private int fused1PassGroupThreshold = 1_000_000;  // Use fused 1-pass for < 1M groups
+        
+        public Config() {}
+        
+        public Config setExecutionMode(ExecutionMode mode) {
+            this.executionMode = mode;
+            return this;
+        }
+        
+        public ExecutionMode getExecutionMode() {
+            return executionMode;
+        }
+        
+        public Config setEnableWarpReduction(boolean enable) {
+            this.enableWarpReduction = enable;
+            return this;
+        }
+        
+        public boolean isWarpReductionEnabled() {
+            return enableWarpReduction;
+        }
+        
+        public Config setEnablePerfectHash(boolean enable) {
+            this.enablePerfectHash = enable;
+            return this;
+        }
+        
+        public boolean isPerfectHashEnabled() {
+            return enablePerfectHash;
+        }
+        
+        /**
+         * Set the group threshold for fused 1-pass mode.
+         * When the estimated number of groups is below this threshold,
+         * fused 1-pass mode will use direct atomic aggregation.
+         * Above this threshold, it will fall back to other modes.
+         * 
+         * @param threshold Maximum groups for optimal fused 1-pass performance
+         */
+        public Config setFused1PassGroupThreshold(int threshold) {
+            this.fused1PassGroupThreshold = threshold;
+            return this;
+        }
+        
+        public int getFused1PassGroupThreshold() {
+            return fused1PassGroupThreshold;
+        }
+    }
+    
+    /** Global default configuration */
+    private static volatile Config defaultConfig = new Config();
+    
+    /**
+     * Set the global default configuration.
+     * This affects all subsequent execute() calls that don't specify a config.
+     */
+    public static void setDefaultConfig(Config config) {
+        defaultConfig = config;
+    }
+    
+    /**
+     * Get the current global default configuration.
+     */
+    public static Config getDefaultConfig() {
+        return defaultConfig;
     }
 
     // =========================================================================
@@ -259,22 +386,64 @@ public class FusedTransformAggregate {
     // Public API
     // =========================================================================
 
+    /**
+     * Check if fused execution should be used based on the number of expressions
+     * and group-by columns.
+     */
     public static boolean shouldUseFused(int numExpressions, int numGroupByCols) {
         return canFuse(numExpressions, numGroupByCols);
     }
+    
+    /**
+     * Determine the best execution mode based on data characteristics.
+     * 
+     * @param numRows Number of input rows
+     * @param estimatedGroups Estimated number of groups (can be approximate)
+     * @param numExpressions Number of expressions to evaluate
+     * @param config Configuration settings
+     * @return Recommended execution mode
+     */
+    public static ExecutionMode selectBestMode(long numRows, long estimatedGroups,
+                                                int numExpressions, Config config) {
+        if (config.getExecutionMode() != ExecutionMode.AUTO) {
+            return config.getExecutionMode();
+        }
+        
+        // Heuristics for mode selection:
+        // 1. For small group counts (< threshold), fused 1-pass is fastest
+        //    because atomics work well when output fits in L2 cache
+        // 2. For large group counts, JIT transform is more flexible
+        // 3. For very complex expressions, hand-written kernel might be needed
+        
+        if (estimatedGroups < config.getFused1PassGroupThreshold()) {
+            LOG.debug("Selecting FUSED_1PASS mode: {} groups < {} threshold",
+                estimatedGroups, config.getFused1PassGroupThreshold());
+            return ExecutionMode.FUSED_1PASS;
+        } else if (numExpressions <= 6) {
+            LOG.debug("Selecting JIT_TRANSFORM mode: {} groups, {} expressions",
+                estimatedGroups, numExpressions);
+            return ExecutionMode.JIT_TRANSFORM;
+        } else {
+            LOG.debug("Selecting HAND_WRITTEN_KERNEL mode: {} expressions",
+                numExpressions);
+            return ExecutionMode.HAND_WRITTEN_KERNEL;
+        }
+    }
 
     /**
-     * Execute fused transform + aggregate.
+     * Execute fused transform + aggregate with full configuration.
      * 
      * @param inputTable Input table
      * @param groupByIndices Indices of group-by columns
      * @param expressions Expression builder with all expressions
-     * @param enableWarpReduction Whether to use warp-level reduction optimization
+     * @param config Execution configuration
+     * @param estimatedGroups Estimated number of groups (for mode selection, -1 for auto)
      * @return FusedResult containing keys and values Tables
      */
     public static FusedResult execute(Table inputTable, int[] groupByIndices,
                                        ExpressionBuilder expressions,
-                                       boolean enableWarpReduction) {
+                                       Config config,
+                                       long estimatedGroups) {
         if (expressions.size() == 0) {
             throw new IllegalArgumentException("No expressions specified");
         }
@@ -285,12 +454,21 @@ public class FusedTransformAggregate {
             throw new IllegalArgumentException("Input table cannot be null");
         }
 
-        LOG.debug("Executing fused transform+aggregate: {} rows, {} expressions, {} groups",
-            inputTable.getRowCount(), expressions.size(), groupByIndices.length);
+        // Determine execution mode
+        ExecutionMode effectiveMode = config.getExecutionMode();
+        if (effectiveMode == ExecutionMode.AUTO) {
+            long estGroups = estimatedGroups > 0 ? estimatedGroups : 
+                             Math.min(inputTable.getRowCount(), 1_000_000);
+            effectiveMode = selectBestMode(inputTable.getRowCount(), estGroups,
+                                           expressions.size(), config);
+        }
+
+        LOG.debug("Executing fused transform+aggregate: {} rows, {} expressions, mode={}",
+            inputTable.getRowCount(), expressions.size(), effectiveMode);
         
         long startTime = System.nanoTime();
         
-        long[] handles = executeFused(
+        long[] handles = executeFusedWithMode(
             inputTable.getNativeView(),
             groupByIndices,
             expressions.getTransformOps(),
@@ -301,14 +479,52 @@ public class FusedTransformAggregate {
             expressions.getDefaultVals(),
             expressions.getThresholds(),
             expressions.getElseVals(),
-            enableWarpReduction
+            effectiveMode.getNativeValue(),
+            config.isWarpReductionEnabled(),
+            config.isPerfectHashEnabled(),
+            config.getFused1PassGroupThreshold()
         );
         
         long elapsedMs = (System.nanoTime() - startTime) / 1_000_000;
-        LOG.debug("Fused transform+aggregate completed in {} ms", elapsedMs);
+        LOG.debug("Fused transform+aggregate completed in {} ms (mode={})", 
+            elapsedMs, effectiveMode);
 
         // Parse returned handles: [numKeyCols, keyCol0, ..., numValCols, valCol0, ...]
         return parseResult(handles);
+    }
+    
+    /**
+     * Execute fused transform + aggregate with configuration.
+     */
+    public static FusedResult execute(Table inputTable, int[] groupByIndices,
+                                       ExpressionBuilder expressions,
+                                       Config config) {
+        return execute(inputTable, groupByIndices, expressions, config, -1);
+    }
+
+    /**
+     * Execute fused transform + aggregate with default configuration.
+     * 
+     * @param inputTable Input table
+     * @param groupByIndices Indices of group-by columns
+     * @param expressions Expression builder with all expressions
+     * @param enableWarpReduction Whether to use warp-level reduction optimization
+     * @return FusedResult containing keys and values Tables
+     */
+    public static FusedResult execute(Table inputTable, int[] groupByIndices,
+                                       ExpressionBuilder expressions,
+                                       boolean enableWarpReduction) {
+        Config config = new Config()
+            .setEnableWarpReduction(enableWarpReduction);
+        return execute(inputTable, groupByIndices, expressions, config);
+    }
+    
+    /**
+     * Execute fused transform + aggregate with default configuration and warp reduction.
+     */
+    public static FusedResult execute(Table inputTable, int[] groupByIndices,
+                                       ExpressionBuilder expressions) {
+        return execute(inputTable, groupByIndices, expressions, defaultConfig);
     }
     
     /**
@@ -336,15 +552,33 @@ public class FusedTransformAggregate {
         return new FusedResult(keys, values);
     }
 
-    public static FusedResult execute(Table inputTable, int[] groupByIndices,
-                                       ExpressionBuilder expressions) {
-        return execute(inputTable, groupByIndices, expressions, true);
-    }
-
     // =========================================================================
     // Native Methods
     // =========================================================================
 
+    /**
+     * Execute fused transform + aggregate with execution mode.
+     */
+    private static native long[] executeFusedWithMode(
+        long inputTableHandle,
+        int[] groupByIndices,
+        int[] transformOps,
+        int[] aggOps,
+        int[] valueColIndices,
+        int[] condColIndices,
+        int[] otherColIndices,
+        long[] defaultVals,
+        long[] thresholds,
+        long[] elseVals,
+        int executionMode,
+        boolean enableWarpReduction,
+        boolean enablePerfectHash,
+        int fused1PassGroupThreshold
+    );
+
+    /**
+     * Legacy method for backward compatibility.
+     */
     private static native long[] executeFused(
         long inputTableHandle,
         int[] groupByIndices,

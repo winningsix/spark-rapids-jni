@@ -89,3 +89,6 @@ ConfigureBench(PARSE_URI_BENCH
 
 ConfigureBench(BATCHED_AGGREGATE_BENCH
   batched_aggregate.cu)
+
+ConfigureBench(FUSED_JIT_BENCH
+  fused_jit_benchmark.cu)

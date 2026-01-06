@@ -134,6 +134,9 @@ ConfigureTest(BATCHED_AGGREGATE
 ConfigureTest(FUSED_TRANSFORM_AGGREGATE
     fused_transform_aggregate_test.cu)
 
+ConfigureTest(FUSED_TRANSFORM_JIT
+    fused_transform_jit_test.cu)
+
 ConfigureTest(FUSED_COMPARISON_BENCHMARK
     fused_comparison_benchmark.cu)
 

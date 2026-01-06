@@ -238,6 +238,7 @@ add_library(
   src/from_json_to_structs.cu
   src/fused_operators.cu
   src/fused_transform_aggregate.cu
+  src/fused_transform_aggregate_jit.cu
   src/get_json_object.cu
   src/histogram.cu
   src/hive_hash.cu
