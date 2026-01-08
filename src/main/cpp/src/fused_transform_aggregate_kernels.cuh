@@ -78,7 +78,7 @@ struct DeviceExprSpec {
   int32_t cond_col_idx;
   int32_t other_col_idx;
   
-  int64_t default_val;
+  int64_t default_val;        // Default value for coalesce / constant for MUL_SUB_CONST
   int64_t threshold;
   int64_t else_val;
   
@@ -169,6 +169,91 @@ __device__ __forceinline__ OutputType apply_transform(
       OutputType v = is_valid ? static_cast<OutputType>(values[row_idx])
                               : static_cast<OutputType>(spec.default_val);
       result = cond_met ? v : static_cast<OutputType>(spec.else_val);
+      break;
+    }
+    
+    // === TPC-H patterns (Phase 1a) ===
+    
+    case TransformOp::MUL: {
+      // val * other  (TPC-H Q6: l_extendedprice * l_discount)
+      auto const* other_values = static_cast<ValueType const*>(value_ptrs[spec.other_col_idx]);
+      auto const* other_validity = validity_ptrs ? validity_ptrs[spec.other_col_idx] : nullptr;
+      bool other_valid = other_validity == nullptr || cudf::bit_is_set(other_validity, row_idx);
+      
+      if (is_valid && other_valid) {
+        result = static_cast<OutputType>(values[row_idx]) * 
+                 static_cast<OutputType>(other_values[row_idx]);
+      } else {
+        should_aggregate = false;
+      }
+      break;
+    }
+    
+    case TransformOp::MUL_SUB_CONST: {
+      // val * (const - other)  (TPC-H Q1: l_extendedprice * (1 - l_discount))
+      // Uses: value_col_idx = l_extendedprice, other_col_idx = l_discount, default_val = constant (1)
+      auto const* other_values = static_cast<ValueType const*>(value_ptrs[spec.other_col_idx]);
+      auto const* other_validity = validity_ptrs ? validity_ptrs[spec.other_col_idx] : nullptr;
+      bool other_valid = other_validity == nullptr || cudf::bit_is_set(other_validity, row_idx);
+      
+      if (is_valid && other_valid) {
+        OutputType v1 = static_cast<OutputType>(values[row_idx]);
+        OutputType v2 = static_cast<OutputType>(other_values[row_idx]);
+        OutputType constant = static_cast<OutputType>(spec.default_val);
+        result = v1 * (constant - v2);
+      } else {
+        should_aggregate = false;
+      }
+      break;
+    }
+    
+    case TransformOp::CASE_MUL: {
+      // CASE WHEN cond > threshold THEN val * other ELSE else_val  (TPC-H Q14)
+      // Uses: cond_col_idx, value_col_idx, other_col_idx, threshold, else_val
+      auto const* cond_values = static_cast<ValueType const*>(value_ptrs[spec.cond_col_idx]);
+      auto const* cond_validity = validity_ptrs ? validity_ptrs[spec.cond_col_idx] : nullptr;
+      bool cond_valid = cond_validity == nullptr || cudf::bit_is_set(cond_validity, row_idx);
+      
+      auto const* other_values = static_cast<ValueType const*>(value_ptrs[spec.other_col_idx]);
+      auto const* other_validity = validity_ptrs ? validity_ptrs[spec.other_col_idx] : nullptr;
+      bool other_valid = other_validity == nullptr || cudf::bit_is_set(other_validity, row_idx);
+      
+      // Evaluate condition: cond > threshold (for LIKE patterns, threshold=0 and cond=1 if matches)
+      bool cond_met = cond_valid && (cond_values[row_idx] > spec.threshold);
+      
+      if (cond_met && is_valid && other_valid) {
+        result = static_cast<OutputType>(values[row_idx]) * 
+                 static_cast<OutputType>(other_values[row_idx]);
+      } else {
+        result = static_cast<OutputType>(spec.else_val);
+      }
+      break;
+    }
+    
+    case TransformOp::MUL_SUB_CONST_MUL_ADD_CONST: {
+      // TPC-H Q1 sum_charge: val * (const1 - other) * (const2 + cond)
+      // For: l_extendedprice * (1 - l_discount) * (1 + l_tax)
+      // Uses: value_col_idx = a, other_col_idx = b, cond_col_idx = c
+      //       default_val = const1, threshold = const2
+      auto const* other_values = static_cast<ValueType const*>(value_ptrs[spec.other_col_idx]);
+      auto const* other_validity = validity_ptrs ? validity_ptrs[spec.other_col_idx] : nullptr;
+      bool other_valid = other_validity == nullptr || cudf::bit_is_set(other_validity, row_idx);
+      
+      auto const* third_values = static_cast<ValueType const*>(value_ptrs[spec.cond_col_idx]);
+      auto const* third_validity = validity_ptrs ? validity_ptrs[spec.cond_col_idx] : nullptr;
+      bool third_valid = third_validity == nullptr || cudf::bit_is_set(third_validity, row_idx);
+      
+      if (is_valid && other_valid && third_valid) {
+        OutputType a = static_cast<OutputType>(values[row_idx]);
+        OutputType b = static_cast<OutputType>(other_values[row_idx]);
+        OutputType c = static_cast<OutputType>(third_values[row_idx]);
+        OutputType const1 = static_cast<OutputType>(spec.default_val);
+        OutputType const2 = static_cast<OutputType>(spec.threshold);
+        // a * (const1 - b) * (const2 + c)
+        result = a * (const1 - b) * (const2 + c);
+      } else {
+        should_aggregate = false;
+      }
       break;
     }
   }

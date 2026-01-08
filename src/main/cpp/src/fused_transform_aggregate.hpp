@@ -60,7 +60,16 @@ enum class TransformOp : int32_t {
   COALESCE_MUL_OTHER,     // coalesce(val1, d1) * coalesce(val2, d2)
   CONDITIONAL,            // if(cond > threshold) val else default
   CONDITIONAL_COALESCE,   // if(cond > t) coalesce(val, d) else 0
-  // Extensible: add more patterns as needed
+  
+  // TPC-H patterns (Phase 1a)
+  MUL,                    // val * other  (TPC-H Q6: l_extendedprice * l_discount)
+  MUL_SUB_CONST,          // val * (const - other)  (TPC-H Q1: l_extendedprice * (1 - l_discount))
+  CASE_MUL,               // CASE WHEN cond THEN val * other ELSE 0  (TPC-H Q14)
+  
+  // TPC-H Q1 sum_charge pattern: val * (const1 - other) * (const2 + cond)
+  // For: l_extendedprice * (1 - l_discount) * (1 + l_tax)
+  // Uses: value_col=a, other_col=b, cond_col=c, default_val=const1, threshold=const2
+  MUL_SUB_CONST_MUL_ADD_CONST,
 };
 
 /**
@@ -92,7 +101,7 @@ struct FusedExprSpec {
   int32_t other_col_idx;            // Second column index (for COALESCE_MUL_OTHER)
   
   // Constants for transform
-  int64_t default_val;              // Default value for coalesce
+  int64_t default_val;              // Default value for coalesce / constant for MUL_SUB_CONST
   int64_t threshold;                // Threshold for conditional (cond > threshold)
   int64_t else_val;                 // Value when condition is false
   

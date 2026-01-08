@@ -197,43 +197,24 @@ Java_com_nvidia_spark_rapids_jni_FusedTransformAggregate_executeFusedWithMode(
         j_defaults_ptr.get(), j_thresholds_ptr.get(), j_else_vals_ptr.get(),
         enable_warp_reduction, enable_perfect_hash);
     
-    // Execute based on mode
-    auto mode = static_cast<JniExecutionMode>(execution_mode);
+    // Suppress unused parameter warnings (kept for JNI signature compatibility)
+    (void)execution_mode;
+    (void)fused_1pass_group_threshold;
+    
+    // Execute using HAND_WRITTEN_KERNEL only
+    // NOTE: JIT_TRANSFORM, FUSED_1PASS, and AUTO modes have known bugs:
+    // 1. NaN results: JIT CUDA UDF code generation produces incorrect values
+    // 2. Memory leak: Intermediate columns not properly released
+    // 3. Performance: JIT path creates N intermediate columns (not true fusion)
+    //
+    // HAND_WRITTEN_KERNEL provides true fusion with single kernel pass.
+    // All other modes are disabled until bugs are fixed.
     spark_rapids_jni::FusedExecutionResult result;
     
-    switch (mode) {
-      case JniExecutionMode::HAND_WRITTEN_KERNEL:
-        result = spark_rapids_jni::execute_fused_transform_aggregate(
-            input_table, plan,
-            cudf::get_default_stream(),
-            cudf::get_current_device_resource_ref());
-        break;
-        
-      case JniExecutionMode::JIT_TRANSFORM:
-        result = spark_rapids_jni::jit::execute_fused_transform_aggregate_jit(
-            input_table, plan,
-            cudf::get_default_stream(),
-            cudf::get_current_device_resource_ref());
-        break;
-        
-      case JniExecutionMode::FUSED_1PASS:
-        // For now, use JIT implementation
-        // TODO: Add true fused 1-pass kernel
-        result = spark_rapids_jni::jit::execute_fused_transform_aggregate_jit(
-            input_table, plan,
-            cudf::get_default_stream(),
-            cudf::get_current_device_resource_ref());
-        break;
-        
-      case JniExecutionMode::AUTO:
-      default:
-        // Auto-select: use fused 1-pass for small group counts
-        result = spark_rapids_jni::jit::execute_fused_transform_aggregate_hybrid(
-            input_table, plan,
-            cudf::get_default_stream(),
-            cudf::get_current_device_resource_ref());
-        break;
-    }
+    result = spark_rapids_jni::execute_fused_transform_aggregate(
+        input_table, plan,
+        cudf::get_default_stream(),
+        cudf::get_current_device_resource_ref());
     
     return build_output_array(env, result);
   }
@@ -259,12 +240,12 @@ Java_com_nvidia_spark_rapids_jni_FusedTransformAggregate_executeFused(
     jlongArray else_vals,
     jboolean enable_warp_reduction)
 {
-  // Delegate to new function with default mode
+  // Delegate to new function - always uses HAND_WRITTEN_KERNEL mode
   return Java_com_nvidia_spark_rapids_jni_FusedTransformAggregate_executeFusedWithMode(
       env, cls, input_table_handle, group_by_indices, transform_ops, agg_ops,
       value_col_indices, cond_col_indices, other_col_indices,
       default_vals, thresholds, else_vals,
-      static_cast<jint>(JniExecutionMode::AUTO),  // AUTO mode
+      static_cast<jint>(JniExecutionMode::HAND_WRITTEN_KERNEL),  // Force correct mode
       enable_warp_reduction,
       JNI_TRUE,   // enable_perfect_hash
       1000000);   // fused_1pass_group_threshold

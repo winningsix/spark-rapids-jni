@@ -181,6 +181,12 @@ public class FusedTransformAggregate {
     public static final int TRANSFORM_COALESCE_MUL_OTHER = 3;
     public static final int TRANSFORM_CONDITIONAL = 4;
     public static final int TRANSFORM_CONDITIONAL_COALESCE = 5;
+    // TPC-H patterns (Phase 1a)
+    public static final int TRANSFORM_MUL = 6;              // val * other (TPC-H Q6)
+    public static final int TRANSFORM_MUL_SUB_CONST = 7;    // val * (const - other) (TPC-H Q1)
+    public static final int TRANSFORM_CASE_MUL = 8;         // CASE WHEN cond THEN val*other ELSE 0 (TPC-H Q14)
+    // TPC-H Q1 sum_charge: a * (const1 - b) * (const2 + c)
+    public static final int TRANSFORM_MUL_SUB_CONST_MUL_ADD_CONST = 9;
 
     // =========================================================================
     // Aggregation Operations (must match C++ AggOp enum)
@@ -293,6 +299,102 @@ public class FusedTransformAggregate {
             return this;
         }
 
+        // === TPC-H patterns (Phase 1a) ===
+
+        /**
+         * Add MUL transform: val * other (TPC-H Q6: l_extendedprice * l_discount)
+         * 
+         * @param valColIdx First column index (e.g., l_extendedprice)
+         * @param otherColIdx Second column index (e.g., l_discount)
+         * @param aggOp Aggregation operation (typically SUM)
+         */
+        public ExpressionBuilder addMul(int valColIdx, int otherColIdx, int aggOp) {
+            transformOps.add(TRANSFORM_MUL);
+            aggOps.add(aggOp);
+            valueColIndices.add(valColIdx);
+            condColIndices.add(-1);
+            otherColIndices.add(otherColIdx);
+            defaultVals.add(0L);
+            thresholds.add(0L);
+            elseVals.add(0L);
+            return this;
+        }
+
+        /**
+         * Add MUL_SUB_CONST transform: val * (constant - other)
+         * TPC-H Q1: l_extendedprice * (1 - l_discount)
+         * 
+         * @param valColIdx First column index (e.g., l_extendedprice)
+         * @param otherColIdx Second column index (e.g., l_discount)
+         * @param constant The constant value (e.g., 1)
+         * @param aggOp Aggregation operation (typically SUM)
+         */
+        public ExpressionBuilder addMulSubConst(int valColIdx, int otherColIdx, 
+                                                 long constant, int aggOp) {
+            transformOps.add(TRANSFORM_MUL_SUB_CONST);
+            aggOps.add(aggOp);
+            valueColIndices.add(valColIdx);
+            condColIndices.add(-1);
+            otherColIndices.add(otherColIdx);
+            defaultVals.add(constant);  // Use defaultVal to store the constant
+            thresholds.add(0L);
+            elseVals.add(0L);
+            return this;
+        }
+
+        /**
+         * Add CASE_MUL transform: CASE WHEN cond > threshold THEN val * other ELSE elseVal
+         * TPC-H Q14: SUM(CASE WHEN p_type LIKE 'PROMO%' THEN l_extendedprice * (1-l_discount) ELSE 0)
+         * 
+         * For LIKE pattern matching, use condColIdx pointing to a boolean column (0 or 1),
+         * and threshold = 0 (so condition is: colVal > 0, i.e., true).
+         * 
+         * @param valColIdx First column index (e.g., l_extendedprice)
+         * @param otherColIdx Second column index (e.g., (1 - l_discount) pre-computed, or l_discount)
+         * @param condColIdx Condition column index (e.g., boolean from LIKE match)
+         * @param threshold Threshold for condition (cond > threshold)
+         * @param elseVal Value when condition is false (typically 0)
+         * @param aggOp Aggregation operation (typically SUM)
+         */
+        public ExpressionBuilder addCaseMul(int valColIdx, int otherColIdx, int condColIdx,
+                                            long threshold, long elseVal, int aggOp) {
+            transformOps.add(TRANSFORM_CASE_MUL);
+            aggOps.add(aggOp);
+            valueColIndices.add(valColIdx);
+            condColIndices.add(condColIdx);
+            otherColIndices.add(otherColIdx);
+            defaultVals.add(0L);
+            thresholds.add(threshold);
+            elseVals.add(elseVal);
+            return this;
+        }
+        
+        /**
+         * Add a * (const1 - b) * (const2 + c) pattern expression (TPC-H Q1 sum_charge)
+         * 
+         * For: l_extendedprice * (1 - l_discount) * (1 + l_tax)
+         * 
+         * @param valColIdx Primary value column index (a = l_extendedprice)
+         * @param otherColIdx Second column index (b = l_discount)
+         * @param thirdColIdx Third column index (c = l_tax)
+         * @param const1 First constant (for const1 - b, typically 1)
+         * @param const2 Second constant (for const2 + c, typically 1)
+         * @param aggOp Aggregation operation (typically SUM)
+         */
+        public ExpressionBuilder addMulSubConstMulAddConst(int valColIdx, int otherColIdx, 
+                                                            int thirdColIdx, long const1, 
+                                                            long const2, int aggOp) {
+            transformOps.add(TRANSFORM_MUL_SUB_CONST_MUL_ADD_CONST);
+            aggOps.add(aggOp);
+            valueColIndices.add(valColIdx);
+            condColIndices.add(thirdColIdx);  // Use cond_col_idx for third column
+            otherColIndices.add(otherColIdx);
+            defaultVals.add(const1);          // const1 stored in default_val
+            thresholds.add(const2);           // const2 stored in threshold
+            elseVals.add(0L);
+            return this;
+        }
+
         public int size() {
             return transformOps.size();
         }
@@ -363,7 +465,11 @@ public class FusedTransformAggregate {
 
         /** Get number of output groups. */
         public long getNumGroups() {
-            return keys != null ? keys.getRowCount() : 0;
+            // For scalar aggregation (no keys), get row count from values table
+            if (keys != null && keys.getNumberOfColumns() > 0) {
+                return keys.getRowCount();
+            }
+            return values != null ? values.getRowCount() : 0;
         }
 
         @Override
@@ -447,20 +553,32 @@ public class FusedTransformAggregate {
         if (expressions.size() == 0) {
             throw new IllegalArgumentException("No expressions specified");
         }
-        if (groupByIndices == null || groupByIndices.length == 0) {
-            throw new IllegalArgumentException("No group-by columns specified");
+        // Note: groupByIndices can be null or empty for scalar aggregation (no GROUP BY)
+        // In this case, all rows are treated as a single group
+        if (groupByIndices == null) {
+            groupByIndices = new int[0];
         }
         if (inputTable == null) {
             throw new IllegalArgumentException("Input table cannot be null");
         }
 
         // Determine execution mode
-        ExecutionMode effectiveMode = config.getExecutionMode();
-        if (effectiveMode == ExecutionMode.AUTO) {
-            long estGroups = estimatedGroups > 0 ? estimatedGroups : 
-                             Math.min(inputTable.getRowCount(), 1_000_000);
-            effectiveMode = selectBestMode(inputTable.getRowCount(), estGroups,
-                                           expressions.size(), config);
+        // NOTE: JIT_TRANSFORM and FUSED_1PASS modes have known bugs:
+        // - NaN results due to incorrect CUDA UDF code generation
+        // - Memory leaks in intermediate column handling
+        // - Performance degradation (2x slower) because JIT path creates N intermediate columns
+        // 
+        // HAND_WRITTEN_KERNEL is the only correct implementation that provides true fusion:
+        // - Single kernel pass (no intermediate columns)
+        // - Correct type handling
+        // - Proper memory management
+        ExecutionMode effectiveMode = ExecutionMode.HAND_WRITTEN_KERNEL;
+        
+        // Log if user requested a different mode
+        ExecutionMode requestedMode = config.getExecutionMode();
+        if (requestedMode != ExecutionMode.AUTO && requestedMode != ExecutionMode.HAND_WRITTEN_KERNEL) {
+            LOG.warn("Requested execution mode {} has known bugs (NaN results, memory leaks, poor performance). " +
+                     "Forcing HAND_WRITTEN_KERNEL mode for correctness.", requestedMode);
         }
 
         LOG.debug("Executing fused transform+aggregate: {} rows, {} expressions, mode={}",

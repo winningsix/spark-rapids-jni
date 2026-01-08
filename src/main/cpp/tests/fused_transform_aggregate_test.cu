@@ -92,7 +92,7 @@ TEST_F(FusedTransformAggregateTest, CannotFuseEmptyExpressions) {
 
 TEST_F(FusedTransformAggregateTest, CannotFuseNoGroupBy) {
   FusedExecutionPlan plan;
-  // No group-by columns
+  // No group-by columns is now allowed for scalar aggregation
   
   FusedExprSpec spec;
   spec.transform_op = TransformOp::IDENTITY;
@@ -101,8 +101,7 @@ TEST_F(FusedTransformAggregateTest, CannotFuseNoGroupBy) {
   plan.expressions.push_back(spec);
   
   std::string reason;
-  EXPECT_FALSE(can_fuse(plan, &reason));
-  EXPECT_EQ(reason, "No group-by columns specified");
+  EXPECT_TRUE(can_fuse(plan, &reason)) << "Scalar aggregation should be supported";
 }
 
 // ============================================================================

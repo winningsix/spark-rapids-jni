@@ -470,6 +470,7 @@ public class FusedTransformAggregateTest {
 
     @Test
     public void testEmptyGroupBy() {
+        // Empty group-by indices = scalar aggregation (all rows treated as single group)
         try (ColumnVector groupKey = ColumnVector.fromInts(0, 1);
              ColumnVector values = ColumnVector.fromLongs(1, 2);
              Table inputTable = new Table(groupKey, values)) {
@@ -478,9 +479,17 @@ public class FusedTransformAggregateTest {
                 new FusedTransformAggregate.ExpressionBuilder()
                     .addIdentity(1, FusedTransformAggregate.AGG_SUM);
             
-            assertThrows(IllegalArgumentException.class, () -> {
-                FusedTransformAggregate.execute(inputTable, new int[]{}, builder);
-            });
+            try (FusedTransformAggregate.FusedResult result = 
+                    FusedTransformAggregate.execute(inputTable, new int[]{}, builder)) {
+                // Scalar aggregation: 1 group, sum = 1 + 2 = 3
+                assertEquals(1, result.getNumGroups());
+                assertNull(result.getKeys());  // No keys for scalar aggregation
+                assertNotNull(result.getValues());
+                assertEquals(1, result.getValues().getNumberOfColumns());
+                try (HostColumnVector hcv = result.getValues().getColumn(0).copyToHost()) {
+                    assertEquals(3L, hcv.getLong(0));  // sum = 1 + 2
+                }
+            }
         }
     }
 
@@ -497,6 +506,7 @@ public class FusedTransformAggregateTest {
 
     @Test
     public void testNullGroupByIndices() {
+        // Null group-by indices = scalar aggregation (all rows treated as single group)
         try (ColumnVector groupKey = ColumnVector.fromInts(0, 1);
              ColumnVector values = ColumnVector.fromLongs(1, 2);
              Table inputTable = new Table(groupKey, values)) {
@@ -505,9 +515,17 @@ public class FusedTransformAggregateTest {
                 new FusedTransformAggregate.ExpressionBuilder()
                     .addIdentity(1, FusedTransformAggregate.AGG_SUM);
             
-            assertThrows(IllegalArgumentException.class, () -> {
-                FusedTransformAggregate.execute(inputTable, null, builder);
-            });
+            try (FusedTransformAggregate.FusedResult result = 
+                    FusedTransformAggregate.execute(inputTable, null, builder)) {
+                // Scalar aggregation: 1 group, sum = 1 + 2 = 3
+                assertEquals(1, result.getNumGroups());
+                assertNull(result.getKeys());  // No keys for scalar aggregation
+                assertNotNull(result.getValues());
+                assertEquals(1, result.getValues().getNumberOfColumns());
+                try (HostColumnVector hcv = result.getValues().getColumn(0).copyToHost()) {
+                    assertEquals(3L, hcv.getLong(0));  // sum = 1 + 2
+                }
+            }
         }
     }
 

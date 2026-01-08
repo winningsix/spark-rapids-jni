@@ -182,6 +182,55 @@ public:
             std::make_unique<CoalesceIR>(1, 
                 std::make_unique<LiteralIR>(spec.default_val)),
             std::make_unique<LiteralIR>(0));
+      
+      // TPC-H patterns (Phase 1a)
+      case TransformOp::MUL: {
+        // Simple multiply: col1 * col2
+        auto left = std::make_unique<InputRefIR>(0);
+        auto right = std::make_unique<InputRefIR>(1);
+        return std::make_unique<BinaryOpIR>(BinaryOpIR::Op::MUL,
+            std::move(left), std::move(right));
+      }
+      
+      case TransformOp::MUL_SUB_CONST: {
+        // col1 * (const - col2)
+        // Note: constant is stored in default_val (Java side uses defaultVals for this)
+        auto left = std::make_unique<InputRefIR>(0);
+        auto sub = std::make_unique<BinaryOpIR>(BinaryOpIR::Op::SUB,
+            std::make_unique<LiteralIR>(spec.default_val),
+            std::make_unique<InputRefIR>(1));
+        return std::make_unique<BinaryOpIR>(BinaryOpIR::Op::MUL,
+            std::move(left), std::move(sub));
+      }
+      
+      case TransformOp::CASE_MUL: {
+        // CASE WHEN cond > threshold THEN val * other ELSE else_val END
+        auto mul = std::make_unique<BinaryOpIR>(BinaryOpIR::Op::MUL,
+            std::make_unique<InputRefIR>(1),
+            std::make_unique<InputRefIR>(2));
+        return std::make_unique<ConditionalIR>(0, spec.threshold,
+            std::move(mul),
+            std::make_unique<LiteralIR>(spec.else_val));
+      }
+      
+      case TransformOp::MUL_SUB_CONST_MUL_ADD_CONST: {
+        // a * (const1 - b) * (const2 + c)
+        // Input 0 = a (value_col), Input 1 = b (other_col), Input 2 = c (cond_col)
+        // const1 = default_val, const2 = threshold
+        auto a = std::make_unique<InputRefIR>(0);
+        auto sub = std::make_unique<BinaryOpIR>(BinaryOpIR::Op::SUB,
+            std::make_unique<LiteralIR>(spec.default_val),
+            std::make_unique<InputRefIR>(1));
+        auto add = std::make_unique<BinaryOpIR>(BinaryOpIR::Op::ADD,
+            std::make_unique<LiteralIR>(spec.threshold),
+            std::make_unique<InputRefIR>(2));
+        // a * (const1 - b)
+        auto mul1 = std::make_unique<BinaryOpIR>(BinaryOpIR::Op::MUL,
+            std::move(a), std::move(sub));
+        // (a * (const1 - b)) * (const2 + c)
+        return std::make_unique<BinaryOpIR>(BinaryOpIR::Op::MUL,
+            std::move(mul1), std::move(add));
+      }
         
       default:
         CUDF_FAIL("Unknown transform type");
@@ -240,7 +289,16 @@ private:
         spec.transform_op == TransformOp::CONDITIONAL_COALESCE) {
       inputs.insert(inputs.begin(), spec.cond_col_idx);
     }
-    if (spec.transform_op == TransformOp::COALESCE_MUL_OTHER) {
+    if (spec.transform_op == TransformOp::COALESCE_MUL_OTHER ||
+        spec.transform_op == TransformOp::MUL ||
+        spec.transform_op == TransformOp::MUL_SUB_CONST) {
+      inputs.push_back(spec.other_col_idx);
+    }
+    if (spec.transform_op == TransformOp::CASE_MUL) {
+      // CASE_MUL needs: cond, val, other
+      inputs.clear();
+      inputs.push_back(spec.cond_col_idx);
+      inputs.push_back(spec.value_col_idx);
       inputs.push_back(spec.other_col_idx);
     }
     return inputs;
@@ -266,6 +324,8 @@ std::vector<cudf::column_view> get_input_columns(FusedExprSpec const& spec,
       break;
       
     case TransformOp::COALESCE_MUL_OTHER:
+    case TransformOp::MUL:
+    case TransformOp::MUL_SUB_CONST:
       cols.push_back(input.column(spec.value_col_idx));
       cols.push_back(input.column(spec.other_col_idx));
       break;
@@ -274,6 +334,20 @@ std::vector<cudf::column_view> get_input_columns(FusedExprSpec const& spec,
     case TransformOp::CONDITIONAL_COALESCE:
       cols.push_back(input.column(spec.cond_col_idx));
       cols.push_back(input.column(spec.value_col_idx));
+      break;
+    
+    case TransformOp::CASE_MUL:
+      cols.push_back(input.column(spec.cond_col_idx));
+      cols.push_back(input.column(spec.value_col_idx));
+      cols.push_back(input.column(spec.other_col_idx));
+      break;
+    
+    case TransformOp::MUL_SUB_CONST_MUL_ADD_CONST:
+      // a * (const1 - b) * (const2 + c)
+      // Order: Input 0 = a, Input 1 = b, Input 2 = c
+      cols.push_back(input.column(spec.value_col_idx));  // a
+      cols.push_back(input.column(spec.other_col_idx));  // b
+      cols.push_back(input.column(spec.cond_col_idx));   // c
       break;
       
     default:

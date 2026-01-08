@@ -86,6 +86,11 @@ std::string transform_op_name(TransformOp op) {
     case TransformOp::COALESCE_MUL_OTHER: return "COALESCE_MUL_OTHER";
     case TransformOp::CONDITIONAL: return "CONDITIONAL";
     case TransformOp::CONDITIONAL_COALESCE: return "CONDITIONAL_COALESCE";
+    // TPC-H patterns
+    case TransformOp::MUL: return "MUL";
+    case TransformOp::MUL_SUB_CONST: return "MUL_SUB_CONST";
+    case TransformOp::CASE_MUL: return "CASE_MUL";
+    case TransformOp::MUL_SUB_CONST_MUL_ADD_CONST: return "MUL_SUB_CONST_MUL_ADD_CONST";
     default: return "UNKNOWN";
   }
 }
@@ -111,10 +116,8 @@ bool can_fuse(FusedExecutionPlan const& plan, std::string* reason) {
     return false;
   }
   
-  if (plan.group_by_col_indices.empty()) {
-    if (reason) *reason = "No group-by columns specified";
-    return false;
-  }
+  // Note: group_by_col_indices can be empty for scalar aggregation
+  // In this case, all rows are treated as a single group
   
   for (size_t i = 0; i < plan.expressions.size(); ++i) {
     auto const& expr = plan.expressions[i];
@@ -132,10 +135,39 @@ bool can_fuse(FusedExecutionPlan const& plan, std::string* reason) {
       }
     }
     
-    // Validate COALESCE_MUL_OTHER has other column
-    if (expr.transform_op == TransformOp::COALESCE_MUL_OTHER) {
+    // Validate expressions that require other_col_idx
+    if (expr.transform_op == TransformOp::COALESCE_MUL_OTHER ||
+        expr.transform_op == TransformOp::MUL ||
+        expr.transform_op == TransformOp::MUL_SUB_CONST) {
       if (expr.other_col_idx < 0) {
-        if (reason) *reason = "Expression " + std::to_string(i) + " (COALESCE_MUL_OTHER) missing other column";
+        if (reason) *reason = "Expression " + std::to_string(i) + " (" + 
+                              transform_op_name(expr.transform_op) + ") missing other column";
+        return false;
+      }
+    }
+    
+    // Validate CASE_MUL requires both condition and other columns
+    if (expr.transform_op == TransformOp::CASE_MUL) {
+      if (expr.cond_col_idx < 0) {
+        if (reason) *reason = "Expression " + std::to_string(i) + " (CASE_MUL) missing condition column";
+        return false;
+      }
+      if (expr.other_col_idx < 0) {
+        if (reason) *reason = "Expression " + std::to_string(i) + " (CASE_MUL) missing other column";
+        return false;
+      }
+    }
+    
+    // Validate MUL_SUB_CONST_MUL_ADD_CONST requires both other and condition (third) columns
+    if (expr.transform_op == TransformOp::MUL_SUB_CONST_MUL_ADD_CONST) {
+      if (expr.other_col_idx < 0) {
+        if (reason) *reason = "Expression " + std::to_string(i) + 
+                              " (MUL_SUB_CONST_MUL_ADD_CONST) missing other column";
+        return false;
+      }
+      if (expr.cond_col_idx < 0) {
+        if (reason) *reason = "Expression " + std::to_string(i) + 
+                              " (MUL_SUB_CONST_MUL_ADD_CONST) missing third column (cond_col_idx)";
         return false;
       }
     }
@@ -234,47 +266,85 @@ FusedExecutionResult execute_fused_transform_aggregate(
   // Step 1: Build group-by keys table and get groups
   // ============================================================================
   
-  std::vector<cudf::column_view> key_columns;
-  for (auto idx : plan.group_by_col_indices) {
-    CUDF_EXPECTS(idx >= 0 && idx < input.num_columns(),
-                 "Group-by column index out of range");
-    key_columns.push_back(input.column(idx));
-  }
-  cudf::table_view keys_table(key_columns);
-  
-  // Use cudf::groupby to get group information
-  cudf::groupby::groupby groupby_obj(keys_table, cudf::null_policy::EXCLUDE);
-  auto groups = groupby_obj.get_groups(input, stream);
-  
-  cudf::size_type num_groups = groups.offsets.size() - 1;
-  result.stats.num_groups = num_groups;
-  
-  // Convert offsets to per-row group IDs
-  // offsets: [0, 3, 5, 8] -> group_ids: [0,0,0,1,1,2,2,2]
+  cudf::size_type num_groups;
   rmm::device_uvector<cudf::size_type> d_group_ids(num_rows, stream, mr);
+  std::vector<std::unique_ptr<cudf::column>> scalar_agg_dummy_keys;  // For scalar aggregation
+  std::unique_ptr<cudf::table> grouped_keys_table;  // Owns the grouped keys
+  cudf::table_view keys_output_view;  // View of grouped keys for output
   
-  // Copy offsets to device (single memcpy instead of N calls)
-  auto const& offsets = groups.offsets;
-  rmm::device_uvector<cudf::size_type> d_offsets(offsets.size(), stream, mr);
-  cudaMemcpyAsync(d_offsets.data(), offsets.data(), 
-                  offsets.size() * sizeof(cudf::size_type),
-                  cudaMemcpyHostToDevice, stream.value());
-  
-  // Use thrust::upper_bound to compute group IDs efficiently
-  // For each row i, find the group by binary searching offsets
-  // upper_bound returns iterator to first offset > i, minus 1 is the group index
-  {
-    auto row_indices = thrust::make_counting_iterator<cudf::size_type>(0);
-    thrust::upper_bound(rmm::exec_policy_nosync(stream, mr),
-                        d_offsets.begin(), d_offsets.end(),
-                        row_indices, row_indices + num_rows,
-                        d_group_ids.begin());
-    // upper_bound gives us offset index, subtract 1 to get group ID
-    // e.g., if upper_bound returns 2, it means row is in group 1
-    thrust::transform(rmm::exec_policy_nosync(stream, mr),
-                      d_group_ids.begin(), d_group_ids.end(),
-                      d_group_ids.begin(),
-                      [] __device__ (cudf::size_type idx) { return idx - 1; });
+  if (plan.group_by_col_indices.empty()) {
+    // Scalar aggregation: all rows belong to a single group (group_id = 0)
+    num_groups = 1;
+    result.stats.num_groups = num_groups;
+    
+    // Set all group IDs to 0
+    thrust::fill(rmm::exec_policy_nosync(stream, mr),
+                 d_group_ids.begin(), d_group_ids.end(),
+                 cudf::size_type{0});
+    
+    // No keys to output - create empty table view
+    keys_output_view = cudf::table_view{};
+  } else {
+    // Normal grouped aggregation
+    std::vector<cudf::column_view> key_columns;
+    for (auto idx : plan.group_by_col_indices) {
+      CUDF_EXPECTS(idx >= 0 && idx < input.num_columns(),
+                   "Group-by column index out of range");
+      key_columns.push_back(input.column(idx));
+    }
+    cudf::table_view keys_table(key_columns);
+    
+    // Use cudf::groupby to get group information
+    cudf::groupby::groupby groupby_obj(keys_table, cudf::null_policy::EXCLUDE);
+    auto groups = groupby_obj.get_groups(input, stream);
+    
+    num_groups = groups.offsets.size() - 1;
+    result.stats.num_groups = num_groups;
+    
+    // Copy offsets to device (needed for both gather and group_id computation)
+    auto const& offsets = groups.offsets;
+    rmm::device_uvector<cudf::size_type> d_offsets(offsets.size(), stream, mr);
+    cudaMemcpyAsync(d_offsets.data(), offsets.data(), 
+                    offsets.size() * sizeof(cudf::size_type),
+                    cudaMemcpyHostToDevice, stream.value());
+    
+    // IMPORTANT: groups.keys contains ALL rows (sorted by group), not unique keys!
+    // We need to extract one row per group using the offsets.
+    // offsets = [0, 3, 5, 8] means group 0 starts at row 0, group 1 at row 3, etc.
+    // So we gather rows at offsets[0], offsets[1], ..., offsets[num_groups-1]
+    // (d_offsets already has the first num_groups offsets we need)
+    
+    // Gather unique keys (one per group)
+    auto all_keys_table = std::move(groups.keys);  // This has input.num_rows() rows
+    grouped_keys_table = cudf::gather(
+        all_keys_table->view(),
+        cudf::column_view{cudf::data_type{cudf::type_id::INT32}, 
+                          static_cast<cudf::size_type>(num_groups),
+                          d_offsets.data(), nullptr, 0},
+        cudf::out_of_bounds_policy::NULLIFY,
+        stream,
+        mr);
+    keys_output_view = grouped_keys_table->view();
+    
+    // Convert offsets to per-row group IDs
+    // offsets: [0, 3, 5, 8] -> group_ids: [0,0,0,1,1,2,2,2]
+    
+    // Use thrust::upper_bound to compute group IDs efficiently
+    // For each row i, find the group by binary searching offsets
+    // upper_bound returns iterator to first offset > i, minus 1 is the group index
+    {
+      auto row_indices = thrust::make_counting_iterator<cudf::size_type>(0);
+      thrust::upper_bound(rmm::exec_policy_nosync(stream, mr),
+                          d_offsets.begin(), d_offsets.end(),
+                          row_indices, row_indices + num_rows,
+                          d_group_ids.begin());
+      // upper_bound gives us offset index, subtract 1 to get group ID
+      // e.g., if upper_bound returns 2, it means row is in group 1
+      thrust::transform(rmm::exec_policy_nosync(stream, mr),
+                        d_group_ids.begin(), d_group_ids.end(),
+                        d_group_ids.begin(),
+                        [] __device__ (cudf::size_type idx) { return idx - 1; });
+    }
   }
   
   // ============================================================================
@@ -471,36 +541,13 @@ FusedExecutionResult execute_fused_transform_aggregate(
   
   result.output_values = std::make_unique<cudf::table>(std::move(output_columns));
   
-  // Extract unique keys (one per group) using group offsets
-  // groups.offsets: [0, 3, 5, 8] means groups start at indices 0, 3, 5
-  // We need to gather keys at these start positions
-  {
-    std::vector<cudf::size_type> unique_key_indices;
-    unique_key_indices.reserve(num_groups);
-    for (cudf::size_type g = 0; g < num_groups; ++g) {
-      unique_key_indices.push_back(groups.offsets[g]);
-    }
-    
-    // Create device vector of gather indices
-    rmm::device_uvector<cudf::size_type> d_gather_map(num_groups, stream, mr);
-    cudaMemcpyAsync(d_gather_map.data(), unique_key_indices.data(),
-                    num_groups * sizeof(cudf::size_type),
-                    cudaMemcpyHostToDevice, stream.value());
-    
-    // Gather unique keys
-    auto gather_map_col = cudf::column_view(
-        cudf::data_type{cudf::type_id::INT32},
-        num_groups,
-        d_gather_map.data(),
-        nullptr,
-        0);
-    
-    result.output_keys = cudf::gather(
-        groups.keys->view(),
-        gather_map_col,
-        cudf::out_of_bounds_policy::DONT_CHECK,
-        stream,
-        mr);
+  // Extract unique keys
+  if (plan.group_by_col_indices.empty()) {
+    // Scalar aggregation: no keys to output
+    result.output_keys = std::make_unique<cudf::table>();
+  } else {
+    // Normal grouped aggregation: extract unique keys (one per group)
+    result.output_keys = std::move(grouped_keys_table);
   }
   
   stream.synchronize();
