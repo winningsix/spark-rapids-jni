@@ -206,6 +206,7 @@ add_library(
   src/MapZipWithUtilsJNI.cpp
   src/JoinPrimitivesJni.cpp
   src/NativeParquetJni.cpp
+  src/ParquetHybridScanJni.cpp
   src/NumberConverterJni.cpp
   src/ParseURIJni.cpp
   src/RegexRewriteUtilsJni.cpp
