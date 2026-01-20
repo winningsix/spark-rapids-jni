@@ -104,9 +104,10 @@ public class DictionaryOptimization {
     if (!enabled) {
       throw new IllegalStateException("Dictionary optimization is disabled");
     }
+    // Use ordinal() which matches the nativeId values in BinaryOp
     return new ColumnVector(filterDictionaryColumnNative(
         dictionaryColumn.getNativeView(),
-        op.getNativeId(),
+        op.ordinal(),
         compareValue.getScalarHandle()));
   }
 
